@@ -152,8 +152,8 @@ def process_func(example, tokenizer, processor):
 
 def main():
     load_dotenv()
-    os.environ["SWANLAB_API_KEY"] = os.getenv("SWAN_LAB")
-
+    # os.environ["SWANLAB_API_KEY"] = os.getenv("SWAN_LAB")
+    os.environ["SWANLAB_API_KEY"] = "lGGxc7pVzAjnJGrGoNBGL"
     data_fraction = 0.002
 
     # ds = load_dataset("linxy/LaTeX_OCR", "synthetic_handwrite")
