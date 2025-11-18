@@ -169,8 +169,8 @@ def main():
     # model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
     # output_dir = "/root/autodl-fs/output/Qwen3-VL-30B"
 
-    model_id = "/root/autodl-tmp/Qwen3-VL-4B-Instruct"
-    output_dir = "/root/autodl-tmp/Qwen3-VL-4B"
+    model_id = "/lab/shiyh_lab/12432696/VLM/self-llm/Qwen-VL/Qwen3-VL-4B-Instruct"
+    output_dir = "/lab/shiyh_lab/12432696/VLM/self-llm/Qwen-VL/log"
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=os.environ.get("HF_HOME", "./"), use_fast=False,
                                               trust_remote_code=True)

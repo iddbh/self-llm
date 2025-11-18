@@ -1,5 +1,4 @@
 
-from datasets import load_dataset
-
-dataset = load_dataset("linxy/LaTeX_OCR", name="small")
-print(dataset)
+from datasets import DatasetDict
+local_dataset = DatasetDict.load_from_disk("./datasets")
+print(local_dataset)
