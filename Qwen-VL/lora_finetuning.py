@@ -1,99 +1,94 @@
-import os
-
 import torch
-from typing import Any, Dict, List
-
-from datasets import load_dataset, DatasetDict
+from datasets import Dataset
+from modelscope import snapshot_download, AutoTokenizer
+from swanlab.integration.transformers import SwanLabCallback
 from qwen_vl_utils import process_vision_info
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from transformers import (
     TrainingArguments,
     Trainer,
+    DataCollatorForSeq2Seq,
+    Qwen2VLForConditionalGeneration,
     AutoProcessor,
-    AutoTokenizer,
-    AutoConfig,
 )
-import importlib
-import matplotlib.pyplot as plt
-from swanlab.integration.transformers import SwanLabCallback
-from dotenv import load_dotenv
+import swanlab
+import json
+import os
+
+prompt = "你是一个LaText OCR助手,目标是读取用户输入的照片，转换成LaTex公式。"
+model_id = "Qwen/Qwen2-VL-2B-Instruct"
+local_model_path = "./Qwen/Qwen2-VL-2B-Instruct"
+train_dataset_json_path = "latex_ocr_train.json"
+val_dataset_json_path = "latex_ocr_val.json"
+output_dir = "./output/Qwen2-VL-2B-LatexOCR"
+MAX_LENGTH = 8192
 
 
-class Qwen3VLDataCollator:
+def process_func(example):
+    """
+    将数据集进行预处理
+    """
+    input_ids, attention_mask, labels = [], [], []
+    conversation = example["conversations"]
+    image_file_path = conversation[0]["value"]
+    output_content = conversation[1]["value"]
 
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        input_id_tensors = [
-            torch.as_tensor(sample["input_ids"], dtype=torch.long) for sample in features
-        ]
-        attention_tensors = [
-            torch.as_tensor(sample["attention_mask"], dtype=torch.long) for sample in features
-        ]
-        label_tensors = [
-            torch.as_tensor(sample["labels"], dtype=torch.long) for sample in features
-        ]
-
-        max_length = max(t.size(0) for t in input_id_tensors)
-        pad_id = (
-            self.tokenizer.pad_token_id
-            if getattr(self.tokenizer, "pad_token_id", None) is not None
-            else self.tokenizer.eos_token_id
-        )
-        if pad_id is None:
-            raise ValueError("pad_token_id 与 eos_token_id 均为 None，无法进行padding。")
-
-        input_ids = torch.full((len(features), max_length), pad_id, dtype=torch.long)
-        attention_mask = torch.zeros((len(features), max_length), dtype=torch.long)
-        labels = torch.full((len(features), max_length), -100, dtype=torch.long)
-
-        for idx, (ids, attn, lbl) in enumerate(zip(input_id_tensors, attention_tensors, label_tensors)):
-            length = ids.size(0)
-            input_ids[idx, :length] = ids
-            attention_mask[idx, :length] = attn
-            labels[idx, :length] = lbl
-
-        pixel_tensors = []
-        for sample in features:
-            pv = sample["pixel_values"]
-            if not isinstance(pv, torch.Tensor):
-                pv = torch.tensor(pv, dtype=torch.float32)
-            pixel_tensors.append(pv)
-        pixel_values = torch.cat(pixel_tensors, dim=0)
-
-        image_grid_thw = torch.stack(
-            [torch.as_tensor(sample["image_grid_thw"], dtype=torch.long).view(-1) for sample in features], dim=0
-        )
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-        }
-
-
-PROMPT_TEXT = "Transcribe the LaTeX of this image."
-
-
-def process_func(example, tokenizer, processor):
-    MAX_LENGTH = 8192
-    image = example["image"]
-    output_content = example["text"]
     messages = [
         {
             "role": "user",
             "content": [
                 {
                     "type": "image",
-                    "image": image,
+                    "image": f"{image_file_path}",
+                    "resized_height": 500,
+                    "resized_width": 100,
                 },
-                {"type": "text", "text": PROMPT_TEXT},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )  # 获取文本
+    image_inputs, video_inputs = process_vision_info(messages)  # 获取数据数据（预处理过）
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = {key: value.tolist() for key, value in inputs.items()}  # tensor -> list,为了方便拼接
+    instruction = inputs
+
+    response = tokenizer(f"{output_content}", add_special_tokens=False)
+
+    input_ids = (
+            instruction["input_ids"][0] + response["input_ids"] + [tokenizer.pad_token_id]
+    )
+
+    attention_mask = instruction["attention_mask"][0] + response["attention_mask"] + [1]
+    labels = (
+            [-100] * len(instruction["input_ids"][0])
+            + response["input_ids"]
+            + [tokenizer.pad_token_id]
+    )
+    if len(input_ids) > MAX_LENGTH:  # 做一个截断
+        input_ids = input_ids[:MAX_LENGTH]
+        attention_mask = attention_mask[:MAX_LENGTH]
+        labels = labels[:MAX_LENGTH]
+
+    input_ids = torch.tensor(input_ids)
+    attention_mask = torch.tensor(attention_mask)
+    labels = torch.tensor(labels)
+    inputs['pixel_values'] = torch.tensor(inputs['pixel_values'])
+    inputs['image_grid_thw'] = torch.tensor(inputs['image_grid_thw']).squeeze(0)  # 由（1,h,w)变换为（h,w）
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels,
+            "pixel_values": inputs['pixel_values'], "image_grid_thw": inputs['image_grid_thw']}
+
+
+def predict(messages, model):
+    # 准备推理
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -102,185 +97,149 @@ def process_func(example, tokenizer, processor):
         text=[text],
         images=image_inputs,
         videos=video_inputs,
-        do_resize=True,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+
+    # 生成输出
+    generated_ids = model.generate(**inputs, max_new_tokens=MAX_LENGTH)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
 
-    instruction_input_ids = inputs["input_ids"][0]
-
-    instruction_attention_mask = inputs["attention_mask"][0]
-
-    instruction_pixel_values = inputs["pixel_values"]
-
-    instruction_image_grid_thw = inputs["image_grid_thw"][0]
-
-    response = tokenizer(f"{output_content}", add_special_tokens=False)
-    response_input_ids = response["input_ids"]
-    response_attention_mask = response.get(
-        "attention_mask", [1] * len(response_input_ids)
-    )
-
-    eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is not None:
-        if not response_input_ids or response_input_ids[-1] != eos_token_id:
-            response_input_ids = response_input_ids + [eos_token_id]
-            response_attention_mask = response_attention_mask + [1]
-    else:
-        pad_token_id = tokenizer.pad_token_id
-        if pad_token_id is None:
-            raise ValueError("需要定义 eos_token_id 或 pad_token_id 才能结束响应序列。")
-        response_input_ids = response_input_ids + [pad_token_id]
-        response_attention_mask = response_attention_mask + [1]
-
-    input_ids = instruction_input_ids + response_input_ids
-    attention_mask = instruction_attention_mask + response_attention_mask
-    labels = (
-            [-100] * len(instruction_input_ids) + response_input_ids
-    )
-    if len(input_ids) > MAX_LENGTH:
-        input_ids = input_ids[:MAX_LENGTH]
-        attention_mask = attention_mask[:MAX_LENGTH]
-        labels = labels[:MAX_LENGTH]
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "pixel_values": instruction_pixel_values,
-        "image_grid_thw": instruction_image_grid_thw,
-    }
+    return output_text[0]
 
 
-def main():
-    load_dotenv()
-    # os.environ["SWANLAB_API_KEY"] = os.getenv("SWAN_LAB")
-    os.environ["SWANLAB_API_KEY"] = "lGGxc7pVzAjnJGrGoNBGL"
-    data_fraction = 0.002
+# 在modelscope上下载Qwen2-VL模型到本地目录下
+model_dir = snapshot_download(model_id, cache_dir="./", revision="master")
 
-    # ds = load_dataset("linxy/LaTeX_OCR", "synthetic_handwrite")
-    ds = DatasetDict.load_from_disk("./datasets")
-    ds = ds.shuffle(seed=222)
+# 使用Transformers加载模型权重
+tokenizer = AutoTokenizer.from_pretrained(local_model_path, use_fast=False, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(local_model_path)
 
-    train_data = ds["train"].select(range(int(len(ds["train"]) * data_fraction)))
-    print(f"训练数据大小: {len(train_data)}")
-    test_data = ds["test"].select(range(int(len(ds["test"]) * data_fraction)))
-    print(f"测试数据大小: {len(test_data)}")
+origin_model = Qwen2VLForConditionalGeneration.from_pretrained(local_model_path, device_map="auto",
+                                                               torch_dtype=torch.bfloat16, trust_remote_code=True, )
+origin_model.enable_input_require_grads()  # 开启梯度检查点时，要执行该方法
 
-    # model_id = "/root/autodl-fs/Qwen3-VL-30B-A3B-Instruct"
-    # model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
-    # output_dir = "/root/autodl-fs/output/Qwen3-VL-30B"
+# 处理数据集：读取json文件
+train_ds = Dataset.from_json(train_dataset_json_path)
+train_dataset = train_ds.map(process_func)
 
-    model_id = "/lab/shiyh_lab/12432696/VLM/self-llm/Qwen-VL/Qwen3-VL-4B-Instruct"
-    output_dir = "/lab/shiyh_lab/12432696/VLM/self-llm/Qwen-VL/log"
+# 配置LoRA
+config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    inference_mode=False,  # 训练模式
+    r=64,  # Lora 秩
+    lora_alpha=16,  # Lora alaph，具体作用参见 Lora 原理
+    lora_dropout=0.05,  # Dropout 比例
+    bias="none",
+)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=os.environ.get("HF_HOME", "./"), use_fast=False,
-                                              trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(model_id, cache_dir=os.environ.get("HF_HOME", "./"), use_fast=False)
+# 获取LoRA模型
+train_peft_model = get_peft_model(origin_model, config)
 
-    config = AutoConfig.from_pretrained(model_id, cache_dir=os.environ.get("HF_HOME", "./"), trust_remote_code=True)
-    arch = (config.architectures or [None])[0]
-    module_name = f"transformers.models.{config.model_type}.modeling_{config.model_type}"
-    module = importlib.import_module(module_name)
-    model_cls = getattr(module, arch)
-    model = model_cls.from_pretrained(
-        model_id,
-        cache_dir=os.environ.get("HF_HOME", "./"),
-        device_map="auto",
-        trust_remote_code=True,
-    )
+# 配置训练参数
+args = TrainingArguments(
+    output_dir=output_dir,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    logging_steps=10,
+    logging_first_step=10,
+    num_train_epochs=2,
+    save_steps=100,
+    learning_rate=1e-4,
+    save_on_each_node=True,
+    gradient_checkpointing=True,
+    report_to="none",
+)
 
-    model.to(dtype=torch.bfloat16)
-
-    model.config.use_cache = False
-
-    map_kwargs = {"tokenizer": tokenizer, "processor": processor}
-    train_dataset = train_data.map(
-        process_func,
-        remove_columns=train_data.column_names,
-        fn_kwargs=map_kwargs,
-    )
-
-    lora_config_dict = {
-        "lora_rank": 128,
+# 设置SwanLab回调
+swanlab_callback = SwanLabCallback(
+    project="Qwen2-VL-ft-latexocr",
+    experiment_name="7B-1kdata",
+    config={
+        "model": "https://modelscope.cn/models/Qwen/Qwen2-VL-7B-Instruct",
+        "dataset": "https://modelscope.cn/datasets/AI-ModelScope/LaTeX_OCR/summary",
+        # "github": "https://github.com/datawhalechina/self-llm",
+        "model_id": model_id,
+        "train_dataset_json_path": train_dataset_json_path,
+        "val_dataset_json_path": val_dataset_json_path,
+        "output_dir": output_dir,
+        "prompt": prompt,
+        "train_data_number": len(train_ds),
+        "token_max_length": MAX_LENGTH,
+        "lora_rank": 64,
         "lora_alpha": 16,
-        "lora_dropout": 0,
-    }
+        "lora_dropout": 0.1,
+    },
+)
 
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=target_modules,
-        inference_mode=False,
-        r=lora_config_dict["lora_rank"],
-        lora_alpha=lora_config_dict["lora_alpha"],
-        lora_dropout=lora_config_dict["lora_dropout"],
-        bias="none",
-    )
+# 配置Trainer
+trainer = Trainer(
+    model=train_peft_model,
+    args=args,
+    train_dataset=train_dataset,
+    data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
+    callbacks=[swanlab_callback],
+)
 
-    peft_model = get_peft_model(model, config)
+# 开启模型训练
+trainer.train()
 
-    peft_model.enable_input_require_grads()
+# ====================测试===================
+# 配置测试参数
+val_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    inference_mode=True,  # 训练模式
+    r=64,  # Lora 秩
+    lora_alpha=16,  # Lora alaph，具体作用参见 Lora 原理
+    lora_dropout=0.05,  # Dropout 比例
+    bias="none",
+)
 
-    swanlab_callback = SwanLabCallback(
-        project="Qwen3-VL-finetune",
-        experiment_name="qwen3-vl-latex-ocr",
-        config={
-            "model": model_id,
-            "dataset": "linxy/LaTeX_OCR",
-            "prompt": PROMPT_TEXT,
-            "train_data_number": len(train_data),
-            "lora_rank": lora_config_dict["lora_rank"],
-            "lora_alpha": lora_config_dict["lora_alpha"],
-            "lora_dropout": lora_config_dict["lora_dropout"],
-        },
-    )
+# 获取测试模型，从output_dir中获取最新的checkpoint
+load_model_path = f"{output_dir}/checkpoint-{max([int(d.split('-')[-1]) for d in os.listdir(output_dir) if d.startswith('checkpoint-')])}"
+print(f"load_model_path: {load_model_path}")
+val_peft_model = PeftModel.from_pretrained(origin_model, model_id=load_model_path, config=val_config)
 
-    args = TrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=8,  # 每个GPU的batch size
-        gradient_accumulation_steps=1,  # 梯度累积步数
-        logging_steps=10,
-        logging_first_step=5,
-        num_train_epochs=8,  # 训练轮数
-        save_steps=50,  # 每多少步保存一次模型
-        save_total_limit=3,  # 最多保存模型数量
-        learning_rate=1e-4,  # 学习率
-        gradient_checkpointing=True,  # 梯度检查点
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        report_to="none",
-    )
+# 读取测试数据
+with open(val_dataset_json_path, "r") as f:
+    test_dataset = json.load(f)
 
-    eval_dataset = test_data.map(
-        process_func,
-        remove_columns=test_data.column_names,
-        fn_kwargs=map_kwargs,
-    )
+test_image_list = []
+for item in test_dataset:
+    image_file_path = item["conversations"][0]["value"]
+    label = item["conversations"][1]["value"]
 
-    trainer = Trainer(
-        model=peft_model,
-        args=args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=Qwen3VLDataCollator(tokenizer=tokenizer),
-        callbacks=[swanlab_callback],
-    )
+    messages = [{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": image_file_path,
+                "resized_height": 100,
+                "resized_width": 500,
+            },
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ]}]
 
-    trainer.train()
+    response = predict(messages, val_peft_model)
 
-    logs = trainer.state.log_history
-    steps = [log['step'] for log in logs if 'loss' in log]
-    losses = [log['loss'] for log in logs if 'loss' in log]
-    plt.plot(steps, losses)
-    plt.xlabel('Step')
-    plt.ylabel('Loss')
-    plt.title('Training Loss (Qwen3-VL-30B)')
+    print(f"predict:{response}")
+    print(f"gt:{label}\n")
 
-    os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, "training_loss.png"))
+    test_image_list.append(swanlab.Image(image_file_path, caption=response))
 
-    trainer.model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    processor.save_pretrained(output_dir)
+swanlab.log({"Prediction": test_image_list})
 
-
-if __name__ == "__main__":
-    main()
+# 在Jupyter Notebook中运行时要停止SwanLab记录，需要调用swanlab.finish()
+swanlab.finish()
