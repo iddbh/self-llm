@@ -15,7 +15,7 @@ import swanlab
 import json
 import os
 
-prompt = "你是一个LaText OCR助手,目标是读取用户输入的照片，转换成LaTex公式。"
+prompt = "你是一个LaText OCR助手,目标是读取用户输入的照片，转换成LaTex公式(注意输出格式一定要满Latex输出格式以及数学规范)。"
 model_id = "Qwen/Qwen2-VL-2B-Instruct"
 local_model_path = "./Qwen/Qwen2-VL-2B-Instruct"
 train_dataset_json_path = "latex_ocr_train.json"
